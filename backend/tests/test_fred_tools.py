@@ -84,3 +84,98 @@ async def test_get_fred_observations_defaults_dates_to_none(monkeypatch):
     await fred.get_fred_observations.ainvoke({"series_id": "CPIAUCSL"})
 
     assert fake_service.calls == [("CPIAUCSL", None, None)]
+
+
+class FakeAzureSearchService:
+    def __init__(self):
+        self.fred_series_docs = []
+        self.fred_observations_docs = []
+
+    async def index_fred_series(self, documents):
+        self.fred_series_docs.extend(documents)
+
+    async def index_fred_observations(self, documents):
+        self.fred_observations_docs.extend(documents)
+
+
+def test_to_fred_series_document_maps_id_to_series_id_and_adds_category():
+    metadata = {
+        "id": "CPIAUCSL",
+        "title": "Consumer Price Index",
+        "frequency": "Monthly",
+        "units": "Index",
+        "seasonal_adjustment": "SA",
+        "notes": "Some notes",
+    }
+
+    doc = fred._to_fred_series_document("cpi", metadata)
+
+    assert doc == {
+        "series_id": "CPIAUCSL",
+        "title": "Consumer Price Index",
+        "category": "cpi",
+        "frequency": "Monthly",
+        "units": "Index",
+        "seasonal_adjustment": "SA",
+        "notes": "Some notes",
+    }
+
+
+def test_to_fred_observation_documents_flattens_one_row_per_date():
+    selected_docs = [
+        {
+            "metadata": {"id": "CPIAUCSL"},
+            "data": [
+                {"date": "2024-01-01", "value": "1.0"},
+                {"date": "2024-02-01", "value": "1.1"},
+            ],
+        }
+    ]
+
+    docs = fred._to_fred_observation_documents("cpi", selected_docs)
+
+    assert docs == [
+        {"id": "CPIAUCSL_2024-01-01", "series_id": "CPIAUCSL", "date": "2024-01-01", "value": "1.0", "category": "cpi"},
+        {"id": "CPIAUCSL_2024-02-01", "series_id": "CPIAUCSL", "date": "2024-02-01", "value": "1.1", "category": "cpi"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_indicator_to_azure_search_pushes_series_and_observations(monkeypatch):
+    fake_search = FakeAzureSearchService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+
+    metadata_collection = FakeCollection([
+        {"id": "CPIAUCSL", "title": "CPI", "frequency": "Monthly", "units": "Index", "seasonal_adjustment": "SA"},
+    ])
+    selected_collection = FakeCollection([
+        {"metadata": {"id": "CPIAUCSL"}, "data": [{"date": "2024-01-01", "value": "1.0"}]},
+    ])
+
+    await fred.sync_indicator_to_azure_search("cpi", metadata_collection, selected_collection)
+
+    assert fake_search.fred_series_docs == [
+        {
+            "series_id": "CPIAUCSL",
+            "title": "CPI",
+            "category": "cpi",
+            "frequency": "Monthly",
+            "units": "Index",
+            "seasonal_adjustment": "SA",
+            "notes": None,
+        }
+    ]
+    assert fake_search.fred_observations_docs == [
+        {"id": "CPIAUCSL_2024-01-01", "series_id": "CPIAUCSL", "date": "2024-01-01", "value": "1.0", "category": "cpi"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sync_indicator_to_azure_search_skips_empty_collections(monkeypatch):
+    fake_search = FakeAzureSearchService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+
+    await fred.sync_indicator_to_azure_search("cpi", FakeCollection([]), FakeCollection([]))
+
+    assert fake_search.fred_series_docs == []
+    assert fake_search.fred_observations_docs == []

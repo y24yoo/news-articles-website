@@ -10,6 +10,7 @@ from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 from pymongo import MongoClient
+from services.azure_search_service import AzureSearchService
 from services.daytona_service import DatasetFile, DaytonaService
 from services.fred_service import FredApiError, FredService
 
@@ -36,6 +37,7 @@ CONNECTION_STRING = "mongodb://127.0.0.1:27017/?directConnection=true"
 client = MongoClient(CONNECTION_STRING)
 fred_service = FredService(api_key=fred_api)
 daytona_service = DaytonaService()
+azure_search_service = AzureSearchService()
 cpi_id = 9
 ppi_id = 31
 interest_rate_id = 22
@@ -57,6 +59,54 @@ _CATEGORY_COLLECTIONS = {
 def _resolve_indicator_collection(category: str):
     db_name, collection_name = _CATEGORY_COLLECTIONS.get(category, ("interest_rate", category))
     return client[db_name][collection_name]
+
+def _to_fred_series_document(category: str, metadata: dict) -> dict:
+    """Map a Mongo indicator-metadata doc onto the fred-series index schema."""
+    return {
+        "series_id": metadata["id"],
+        "title": metadata["title"],
+        "category": category,
+        "frequency": metadata["frequency"],
+        "units": metadata["units"],
+        "seasonal_adjustment": metadata["seasonal_adjustment"],
+        "notes": metadata.get("notes"),
+    }
+
+def _to_fred_observation_documents(category: str, selected_docs) -> list[dict]:
+    """Flatten {metadata: {id: ...}, data: [{date, value}, ...]} docs onto the
+    fred-observations index schema (one row per series/date)."""
+    documents = []
+    for doc in selected_docs:
+        series_id = doc["metadata"]["id"]
+        for point in doc.get("data", []):
+            documents.append({
+                "id": f"{series_id}_{point['date']}",
+                "series_id": series_id,
+                "date": point["date"],
+                "value": point["value"],
+                "category": category,
+            })
+    return documents
+
+async def sync_indicator_to_azure_search(category: str, metadata_collection, selected_collection) -> None:
+    """Push a category's Mongo-stored indicator metadata + observations into
+    Azure AI Search. MongoDB stays the source of truth until Azure AI Search
+    is proven (Phase 4/5) -- this is an additional write path, not a cutover.
+    """
+    metadata_docs = [_to_fred_series_document(category, doc) for doc in metadata_collection.find({}, {"_id": 0})]
+    if metadata_docs:
+        await azure_search_service.index_fred_series(metadata_docs)
+
+    observation_docs = _to_fred_observation_documents(category, selected_collection.find())
+    if observation_docs:
+        await azure_search_service.index_fred_observations(observation_docs)
+
+async def sync_cpi_to_azure_search() -> None:
+    """Phase 4's "migrate CPI first" step. Once this is verified against a
+    real Azure AI Search resource, the same sync_indicator_to_azure_search
+    call can be repeated for ppi/gdp/interest_rate/unemployment_rate.
+    """
+    await sync_indicator_to_azure_search("cpi", client["cpi"]["cpi"], client["cpi"]["selected_cpi"])
 
 @tool
 def search_fred_indicators(category: str, query: str = ""):
