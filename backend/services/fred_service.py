@@ -74,6 +74,7 @@ class FredService:
         self,
         series_id: str,
         observation_start: str | None = None,
+        observation_end: str | None = None,
     ) -> list:
         """Return [{"date": ..., "value": ...}, ...] for a series."""
         params = {
@@ -81,6 +82,8 @@ class FredService:
             "series_id": series_id,
             "observation_start": observation_start or self._observation_start(),
         }
+        if observation_end is not None:
+            params["observation_end"] = observation_end
         response = await self._client.get(FRED_BASE_URL + OBSERVATION_ENDPOINT, params=params)
         payload = response.json()
         if response.status_code != 200 or "observations" not in payload:
