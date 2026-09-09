@@ -43,6 +43,43 @@ unemployment_rate_id = 32447
 gdp_id = 106
 shared_gdp_id = 33020
 
+# Maps a category name to the Mongo (database, collection) holding its indicator
+# metadata. Anything not listed here is treated as an interest-rate sector name
+# (see interest_rate(), which creates one collection per sector).
+_CATEGORY_COLLECTIONS = {
+    "cpi": ("cpi", "cpi"),
+    "ppi": ("ppi", "ppi"),
+    "gdp": ("gdp", "gdp"),
+    "shared_gdp": ("gdp", "shared_gdp"),
+    "unemployment_rate": ("unemployment_rate", "unemployment_rate"),
+}
+
+def _resolve_indicator_collection(category: str):
+    db_name, collection_name = _CATEGORY_COLLECTIONS.get(category, ("interest_rate", category))
+    return client[db_name][collection_name]
+
+@tool
+def search_fred_indicators(category: str, query: str = ""):
+    """Search stored FRED indicator metadata for a category.
+
+    `category` is one of cpi/ppi/gdp/shared_gdp/unemployment_rate, or an
+    interest-rate sector name (see interest_rate() for the available names).
+    `query`, if given, filters by a case-insensitive substring match against
+    the indicator title.
+    """
+    collection = _resolve_indicator_collection(category)
+    mongo_filter = {"title": {"$regex": query, "$options": "i"}} if query else {}
+    return list(collection.find(mongo_filter, {"_id": 0}))
+
+@tool
+async def get_fred_observations(series_id: str, start_date: str | None = None, end_date: str | None = None):
+    """Fetch a FRED series' observations directly from the FRED API.
+
+    `start_date`/`end_date` are "YYYY-MM-DD" strings; both are optional
+    (start_date defaults to a multi-year lookback, end_date to "today").
+    """
+    return await fred_service.get_series_observations(series_id, observation_start=start_date, observation_end=end_date)
+
 async def _ingest_category_series(collection, category_id, *, keep=lambda raw: True):
     """Fetch a FRED category's series and insert each one's metadata into `collection`."""
     series = await fred_service.get_category_series(category_id)
@@ -53,20 +90,14 @@ async def _ingest_category_series(collection, category_id, *, keep=lambda raw: T
 async def cpi():
     await _ingest_category_series(client["cpi"]["cpi"], cpi_id)
 
-@tool
-def search_indicators_cpi():
-    """Pull CPI indicators"""
-    db = client["cpi"]
-    docs = list(db["cpi"].find({}, {"_id": 0}))
-    return docs
-
 async def selector_cpi():
     await cpi()
     model = ChatOpenAI(model="gpt-5-mini-2025-08-07")
-    agent = create_agent(model, response_format=ListFredSeriesMetadata, tools=[search_indicators_cpi])
+    agent = create_agent(model, response_format=ListFredSeriesMetadata, tools=[search_fred_indicators])
     db = client["cpi"]
     result = agent.invoke({"messages": [{"role": "user", "content": (
                         "Select the best 3 indicators to represent the CPI. "
+                        "You MUST call search_fred_indicators with category='cpi' "
                         "and only use those indicators. "
                         "Explain why each indicator is chosen in the reason object.")}]})
     docs = [item.model_dump() for item in result["structured_response"].list_metadata]
@@ -98,16 +129,9 @@ async def interest_rate():
         for raw in series:
             db[name].insert_one(FredService.get_series_metadata(raw))
 
-@tool
-def search_indicators_interest_rate(sector_name: str):
-    """Pull interest rate indicators for a given sector/category name."""
-    db = client["interest_rate"]
-    docs = list(db[sector_name].find({}, {"_id": 0}))
-    return docs
-
 async def selector_interest_rate():
     model = ChatOpenAI(model="gpt-5-mini-2025-08-07")
-    agent = create_agent(model, response_format=ListFredSeriesMetadata, tools=[search_indicators_interest_rate])
+    agent = create_agent(model, response_format=ListFredSeriesMetadata, tools=[search_fred_indicators])
     source_db = client["interest_rate"]
     target_db = client["selected_interest_rate"]
     tasks = []
@@ -115,7 +139,7 @@ async def selector_interest_rate():
         for rate in source_db.list_collection_names():
             task = tg.create_task(agent.ainvoke({"messages": [{"role": "user", "content": (
                         f"Select the best 2 indicators to represent the '{rate}' rate. "
-                        f"You MUST call search_indicators with rate_name='{rate}' "
+                        f"You MUST call search_fred_indicators with category='{rate}' "
                         f"and only use those indicators. "
                         f"If '{rate}' is not an important rate to analysis economy pick 0 or 1 indicator"
                         f"Explain why each indicator is chosen in the reason object.")}]}))

@@ -59,6 +59,26 @@ async def test_get_series_observations_honors_explicit_start():
 
 
 @pytest.mark.asyncio
+async def test_get_series_observations_honors_explicit_end():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["observation_end"] == "2024-01-01"
+        return httpx.Response(200, json={"observations": []})
+
+    service = make_service(handler)
+    await service.get_series_observations("CPIAUCSL", observation_end="2024-01-01")
+
+
+@pytest.mark.asyncio
+async def test_get_series_observations_omits_end_when_not_given():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert "observation_end" not in request.url.params
+        return httpx.Response(200, json={"observations": []})
+
+    service = make_service(handler)
+    await service.get_series_observations("CPIAUCSL")
+
+
+@pytest.mark.asyncio
 async def test_get_series_observations_raises_on_bad_response():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"error_message": "Bad Request"})
