@@ -18,6 +18,11 @@ class FakeCollection:
         return [doc for doc in self._docs if pattern.search(doc.get("title", ""))]
 
 
+class FakeDatabase(dict):
+    def list_collection_names(self):
+        return list(self.keys())
+
+
 class FakeFredService:
     def __init__(self, observations):
         self._observations = observations
@@ -28,39 +33,43 @@ class FakeFredService:
         return self._observations
 
 
-def test_resolve_indicator_collection_known_category(monkeypatch):
-    cpi_collection = FakeCollection([])
-    monkeypatch.setattr(fred, "client", {"cpi": {"cpi": cpi_collection}})
+class FakeAzureSearchService:
+    def __init__(self, search_results=None):
+        self.fred_series_docs = []
+        self.fred_observations_docs = []
+        self.search_calls = []
+        self._search_results = search_results or []
 
-    assert fred._resolve_indicator_collection("cpi") is cpi_collection
+    async def index_fred_series(self, documents):
+        self.fred_series_docs.extend(documents)
 
+    async def index_fred_observations(self, documents):
+        self.fred_observations_docs.extend(documents)
 
-def test_resolve_indicator_collection_falls_back_to_interest_rate_sector(monkeypatch):
-    sector_collection = FakeCollection([])
-    monkeypatch.setattr(fred, "client", {"interest_rate": {"Treasury_Bills": sector_collection}})
-
-    assert fred._resolve_indicator_collection("Treasury_Bills") is sector_collection
-
-
-def test_search_fred_indicators_returns_all_docs_without_query(monkeypatch):
-    docs = [{"id": "CPIAUCSL", "title": "CPI for All Urban Consumers"}]
-    monkeypatch.setattr(fred, "client", {"cpi": {"cpi": FakeCollection(docs)}})
-
-    result = fred.search_fred_indicators.invoke({"category": "cpi"})
-
-    assert result == docs
+    async def search_fred_series(self, query, category=None, top=5):
+        self.search_calls.append((query, category, top))
+        return self._search_results
 
 
-def test_search_fred_indicators_filters_by_query(monkeypatch):
-    docs = [
-        {"id": "CPIAUCSL", "title": "Consumer Price Index"},
-        {"id": "CPILFESL", "title": "Core CPI Less Food and Energy"},
-    ]
-    monkeypatch.setattr(fred, "client", {"cpi": {"cpi": FakeCollection(docs)}})
+@pytest.mark.asyncio
+async def test_search_fred_indicators_uses_wildcard_query_when_empty(monkeypatch):
+    fake_search = FakeAzureSearchService(search_results=[{"series_id": "CPIAUCSL"}])
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
 
-    result = fred.search_fred_indicators.invoke({"category": "cpi", "query": "core"})
+    result = await fred.search_fred_indicators.ainvoke({"category": "cpi"})
 
-    assert result == [docs[1]]
+    assert result == [{"series_id": "CPIAUCSL"}]
+    assert fake_search.search_calls == [("*", "cpi", 5)]
+
+
+@pytest.mark.asyncio
+async def test_search_fred_indicators_passes_query_and_category_through(monkeypatch):
+    fake_search = FakeAzureSearchService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+
+    await fred.search_fred_indicators.ainvoke({"category": "cpi", "query": "important inflation indicators"})
+
+    assert fake_search.search_calls == [("important inflation indicators", "cpi", 5)]
 
 
 @pytest.mark.asyncio
@@ -84,18 +93,6 @@ async def test_get_fred_observations_defaults_dates_to_none(monkeypatch):
     await fred.get_fred_observations.ainvoke({"series_id": "CPIAUCSL"})
 
     assert fake_service.calls == [("CPIAUCSL", None, None)]
-
-
-class FakeAzureSearchService:
-    def __init__(self):
-        self.fred_series_docs = []
-        self.fred_observations_docs = []
-
-    async def index_fred_series(self, documents):
-        self.fred_series_docs.extend(documents)
-
-    async def index_fred_observations(self, documents):
-        self.fred_observations_docs.extend(documents)
 
 
 def test_to_fred_series_document_maps_id_to_series_id_and_adds_category():
@@ -179,3 +176,78 @@ async def test_sync_indicator_to_azure_search_skips_empty_collections(monkeypatc
 
     assert fake_search.fred_series_docs == []
     assert fake_search.fred_observations_docs == []
+
+
+@pytest.mark.asyncio
+async def test_sync_gdp_to_azure_search_pushes_both_gdp_and_shared_gdp(monkeypatch):
+    fake_search = FakeAzureSearchService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+
+    gdp_metadata = FakeCollection([
+        {"id": "GDP", "title": "Gross Domestic Product", "frequency": "Quarterly", "units": "Bil. $", "seasonal_adjustment": "SA"},
+    ])
+    gdp_selected = FakeCollection([{"metadata": {"id": "GDP"}, "data": [{"date": "2024-01-01", "value": "100"}]}])
+    shared_gdp_metadata = FakeCollection([
+        {"id": "A191RL1Q225SBEA", "title": "Real GDP Growth", "frequency": "Quarterly", "units": "Percent", "seasonal_adjustment": "SA"},
+    ])
+    shared_gdp_selected = FakeCollection(
+        [{"metadata": {"id": "A191RL1Q225SBEA"}, "data": [{"date": "2024-01-01", "value": "2.5"}]}]
+    )
+
+    monkeypatch.setattr(fred, "client", {
+        "gdp": {
+            "gdp": gdp_metadata,
+            "selected_gdp": gdp_selected,
+            "shared_gdp": shared_gdp_metadata,
+            "selected_shared_gdp": shared_gdp_selected,
+        },
+    })
+
+    await fred.sync_gdp_to_azure_search()
+
+    series_categories = {doc["category"] for doc in fake_search.fred_series_docs}
+    assert series_categories == {"gdp", "shared_gdp"}
+    assert len(fake_search.fred_observations_docs) == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_interest_rate_to_azure_search_pushes_each_sector_with_selected_data(monkeypatch):
+    fake_search = FakeAzureSearchService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+
+    source_db = FakeDatabase({
+        "Treasury_Bills": FakeCollection([
+            {"id": "TB3MS", "title": "3-Month Treasury Bill", "frequency": "Monthly", "units": "Percent", "seasonal_adjustment": "NSA"},
+        ]),
+        "Monetary_Policy": FakeCollection([
+            {"id": "FEDFUNDS", "title": "Federal Funds Rate", "frequency": "Monthly", "units": "Percent", "seasonal_adjustment": "NSA"},
+        ]),
+    })
+    target_db = FakeDatabase({
+        "Treasury_Bills": FakeCollection([{"metadata": {"id": "TB3MS"}, "data": [{"date": "2024-01-01", "value": "5.0"}]}]),
+        # Monetary_Policy has no selected-indicator collection yet -- should be skipped, not error.
+    })
+    monkeypatch.setattr(fred, "client", {"interest_rate": source_db, "selected_interest_rate": target_db})
+
+    await fred.sync_interest_rate_to_azure_search()
+
+    assert [doc["series_id"] for doc in fake_search.fred_series_docs] == ["TB3MS"]
+    assert [doc["series_id"] for doc in fake_search.fred_observations_docs] == ["TB3MS"]
+
+
+@pytest.mark.asyncio
+async def test_sync_all_indicators_to_azure_search_calls_every_category(monkeypatch):
+    calls = []
+
+    async def record(name):
+        calls.append(name)
+
+    monkeypatch.setattr(fred, "sync_cpi_to_azure_search", lambda: record("cpi"))
+    monkeypatch.setattr(fred, "sync_ppi_to_azure_search", lambda: record("ppi"))
+    monkeypatch.setattr(fred, "sync_gdp_to_azure_search", lambda: record("gdp"))
+    monkeypatch.setattr(fred, "sync_interest_rate_to_azure_search", lambda: record("interest_rate"))
+    monkeypatch.setattr(fred, "sync_unemployment_rate_to_azure_search", lambda: record("unemployment_rate"))
+
+    await fred.sync_all_indicators_to_azure_search()
+
+    assert calls == ["cpi", "ppi", "gdp", "interest_rate", "unemployment_rate"]

@@ -45,21 +45,6 @@ unemployment_rate_id = 32447
 gdp_id = 106
 shared_gdp_id = 33020
 
-# Maps a category name to the Mongo (database, collection) holding its indicator
-# metadata. Anything not listed here is treated as an interest-rate sector name
-# (see interest_rate(), which creates one collection per sector).
-_CATEGORY_COLLECTIONS = {
-    "cpi": ("cpi", "cpi"),
-    "ppi": ("ppi", "ppi"),
-    "gdp": ("gdp", "gdp"),
-    "shared_gdp": ("gdp", "shared_gdp"),
-    "unemployment_rate": ("unemployment_rate", "unemployment_rate"),
-}
-
-def _resolve_indicator_collection(category: str):
-    db_name, collection_name = _CATEGORY_COLLECTIONS.get(category, ("interest_rate", category))
-    return client[db_name][collection_name]
-
 def _to_fred_series_document(category: str, metadata: dict) -> dict:
     """Map a Mongo indicator-metadata doc onto the fred-series index schema."""
     return {
@@ -102,24 +87,53 @@ async def sync_indicator_to_azure_search(category: str, metadata_collection, sel
         await azure_search_service.index_fred_observations(observation_docs)
 
 async def sync_cpi_to_azure_search() -> None:
-    """Phase 4's "migrate CPI first" step. Once this is verified against a
-    real Azure AI Search resource, the same sync_indicator_to_azure_search
-    call can be repeated for ppi/gdp/interest_rate/unemployment_rate.
-    """
+    """Phase 4's "migrate CPI first" step."""
     await sync_indicator_to_azure_search("cpi", client["cpi"]["cpi"], client["cpi"]["selected_cpi"])
 
+async def sync_ppi_to_azure_search() -> None:
+    await sync_indicator_to_azure_search("ppi", client["ppi"]["ppi"], client["ppi"]["selected_ppi"])
+
+async def sync_unemployment_rate_to_azure_search() -> None:
+    db = client["unemployment_rate"]
+    await sync_indicator_to_azure_search(
+        "unemployment_rate", db["unemployment_rate"], db["selected_unemployment_rate"]
+    )
+
+async def sync_gdp_to_azure_search() -> None:
+    db = client["gdp"]
+    await sync_indicator_to_azure_search("gdp", db["gdp"], db["selected_gdp"])
+    await sync_indicator_to_azure_search("shared_gdp", db["shared_gdp"], db["selected_shared_gdp"])
+
+async def sync_interest_rate_to_azure_search() -> None:
+    source_db = client["interest_rate"]
+    target_db = client["selected_interest_rate"]
+    for sector in source_db.list_collection_names():
+        if sector in target_db.list_collection_names():
+            await sync_indicator_to_azure_search(sector, source_db[sector], target_db[sector])
+
+async def sync_all_indicators_to_azure_search() -> None:
+    """Phase 4's "once CPI works, migrate PPI/GDP/interest rates/unemployment" step.
+
+    This has NOT been verified against a real Azure AI Search resource --
+    there are no Azure credentials in this environment. Run it and confirm
+    the results before treating Phase 5 (removing MongoDB) as safe.
+    """
+    await sync_cpi_to_azure_search()
+    await sync_ppi_to_azure_search()
+    await sync_gdp_to_azure_search()
+    await sync_interest_rate_to_azure_search()
+    await sync_unemployment_rate_to_azure_search()
+
 @tool
-def search_fred_indicators(category: str, query: str = ""):
-    """Search stored FRED indicator metadata for a category.
+async def search_fred_indicators(category: str, query: str = ""):
+    """Semantically search FRED indicator metadata for a category via Azure AI Search.
 
     `category` is one of cpi/ppi/gdp/shared_gdp/unemployment_rate, or an
     interest-rate sector name (see interest_rate() for the available names).
-    `query`, if given, filters by a case-insensitive substring match against
-    the indicator title.
+    `query`, if given (e.g. "important inflation indicators"), ranks results
+    semantically; if empty, returns all indicators in the category.
     """
-    collection = _resolve_indicator_collection(category)
-    mongo_filter = {"title": {"$regex": query, "$options": "i"}} if query else {}
-    return list(collection.find(mongo_filter, {"_id": 0}))
+    return await azure_search_service.search_fred_series(query or "*", category=category)
 
 @tool
 async def get_fred_observations(series_id: str, start_date: str | None = None, end_date: str | None = None):
@@ -145,7 +159,7 @@ async def selector_cpi():
     model = ChatOpenAI(model="gpt-5-mini-2025-08-07")
     agent = create_agent(model, response_format=ListFredSeriesMetadata, tools=[search_fred_indicators])
     db = client["cpi"]
-    result = agent.invoke({"messages": [{"role": "user", "content": (
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": (
                         "Select the best 3 indicators to represent the CPI. "
                         "You MUST call search_fred_indicators with category='cpi' "
                         "and only use those indicators. "
