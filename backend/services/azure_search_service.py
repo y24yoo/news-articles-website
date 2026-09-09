@@ -152,10 +152,9 @@ def _default_search_client_factory(endpoint: str, index_name: str, credential: A
 
 
 class AzureSearchService:
-    """Manages the fred-series/fred-observations/economic-documents indexes and the
-    query patterns needed so far (Phase 4). MongoDB stays the source of truth
-    until Azure AI Search is proven -- this service is an additional write/read
-    path, not (yet) a replacement.
+    """Manages the fred-series/fred-observations/economic-documents indexes and
+    the query patterns needed so far. As of Phase 5, this is the sole backing
+    store for FRED indicator/observation data -- MongoDB has been removed.
 
     All Azure SDK clients are lazily created via injectable factories so this
     module stays importable and testable without the azure-search-documents /
@@ -227,6 +226,17 @@ class AzureSearchService:
         )
         return [doc async for doc in results]
 
+    async def get_fred_series(self, category: str) -> list[dict]:
+        """Filter-based retrieval of every indexed indicator's metadata for a
+        category (no ranking/relevance -- used to enumerate what's indexed,
+        not to select among it)."""
+        client = self._get_search_client(self.fred_series_index)
+        results = await client.search(
+            search_text="*",
+            filter=f"category eq '{_escape_odata_literal(category)}'",
+        )
+        return [doc async for doc in results]
+
     async def get_fred_observations(
         self,
         series_id: str,
@@ -241,4 +251,15 @@ class AzureSearchService:
             filters.append(f"date le '{_escape_odata_literal(end_date)}'")
         client = self._get_search_client(self.fred_observations_index)
         results = await client.search(search_text="*", filter=" and ".join(filters), order_by=["date asc"])
+        return [doc async for doc in results]
+
+    async def get_observations_by_category(self, category: str) -> list[dict]:
+        """Filter-based retrieval of every indexed observation for a category,
+        across all its series. No vector search."""
+        client = self._get_search_client(self.fred_observations_index)
+        results = await client.search(
+            search_text="*",
+            filter=f"category eq '{_escape_odata_literal(category)}'",
+            order_by=["series_id asc", "date asc"],
+        )
         return [doc async for doc in results]

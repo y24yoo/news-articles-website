@@ -9,7 +9,6 @@ from langchain.agents import create_agent
 from langchain.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
-from pymongo import MongoClient
 from services.azure_search_service import AzureSearchService
 from services.daytona_service import DatasetFile, DaytonaService
 from services.fred_service import FredApiError, FredService
@@ -33,8 +32,6 @@ class ListFredSeriesMetadata(BaseModel):
 
 # Global
 load_dotenv()
-CONNECTION_STRING = "mongodb://127.0.0.1:27017/?directConnection=true"
-client = MongoClient(CONNECTION_STRING)
 fred_service = FredService(api_key=fred_api)
 daytona_service = DaytonaService()
 azure_search_service = AzureSearchService()
@@ -45,23 +42,8 @@ unemployment_rate_id = 32447
 gdp_id = 106
 shared_gdp_id = 33020
 
-# Maps a category name to the Mongo (database, collection) holding its indicator
-# metadata. Anything not listed here is treated as an interest-rate sector name
-# (see interest_rate(), which creates one collection per sector).
-_CATEGORY_COLLECTIONS = {
-    "cpi": ("cpi", "cpi"),
-    "ppi": ("ppi", "ppi"),
-    "gdp": ("gdp", "gdp"),
-    "shared_gdp": ("gdp", "shared_gdp"),
-    "unemployment_rate": ("unemployment_rate", "unemployment_rate"),
-}
-
-def _resolve_indicator_collection(category: str):
-    db_name, collection_name = _CATEGORY_COLLECTIONS.get(category, ("interest_rate", category))
-    return client[db_name][collection_name]
-
 def _to_fred_series_document(category: str, metadata: dict) -> dict:
-    """Map a Mongo indicator-metadata doc onto the fred-series index schema."""
+    """Map a FredService.get_series_metadata() dict onto the fred-series index schema."""
     return {
         "series_id": metadata["id"],
         "title": metadata["title"],
@@ -73,7 +55,7 @@ def _to_fred_series_document(category: str, metadata: dict) -> dict:
     }
 
 def _to_fred_observation_documents(category: str, selected_docs) -> list[dict]:
-    """Flatten {metadata: {id: ...}, data: [{date, value}, ...]} docs onto the
+    """Flatten [{metadata: {id: ...}, data: [{date, value}, ...]}, ...] onto the
     fred-observations index schema (one row per series/date)."""
     documents = []
     for doc in selected_docs:
@@ -88,38 +70,56 @@ def _to_fred_observation_documents(category: str, selected_docs) -> list[dict]:
             })
     return documents
 
-async def sync_indicator_to_azure_search(category: str, metadata_collection, selected_collection) -> None:
-    """Push a category's Mongo-stored indicator metadata + observations into
-    Azure AI Search. MongoDB stays the source of truth until Azure AI Search
-    is proven (Phase 4/5) -- this is an additional write path, not a cutover.
-    """
-    metadata_docs = [_to_fred_series_document(category, doc) for doc in metadata_collection.find({}, {"_id": 0})]
-    if metadata_docs:
-        await azure_search_service.index_fred_series(metadata_docs)
+async def _build_indicator_dataset(category: str) -> list[dict]:
+    """Combine a category's indexed indicator metadata with its indexed
+    observations, for feeding to Daytona's economic-report analysis."""
+    series_metadata = await azure_search_service.get_fred_series(category)
+    observations_by_series: dict[str, list[dict]] = {}
+    for obs in await azure_search_service.get_observations_by_category(category):
+        observations_by_series.setdefault(obs["series_id"], []).append(
+            {"date": obs["date"], "value": obs["value"]}
+        )
+    return [
+        {**metadata, "data": observations_by_series.get(metadata["series_id"], [])}
+        for metadata in series_metadata
+    ]
 
-    observation_docs = _to_fred_observation_documents(category, selected_collection.find())
-    if observation_docs:
-        await azure_search_service.index_fred_observations(observation_docs)
+async def _index_observations_for_selection(category: str, selected: list[Reason]) -> None:
+    """Fetch live FRED observations for each LLM-selected indicator and index
+    them into fred-observations."""
+    selected_docs = []
+    for item in selected:
+        data = await fred_service.get_series_observations(item.metadata.id)
+        selected_docs.append({"metadata": {"id": item.metadata.id}, "data": data})
+    documents = _to_fred_observation_documents(category, selected_docs)
+    if documents:
+        await azure_search_service.index_fred_observations(documents)
 
-async def sync_cpi_to_azure_search() -> None:
-    """Phase 4's "migrate CPI first" step. Once this is verified against a
-    real Azure AI Search resource, the same sync_indicator_to_azure_search
-    call can be repeated for ppi/gdp/interest_rate/unemployment_rate.
-    """
-    await sync_indicator_to_azure_search("cpi", client["cpi"]["cpi"], client["cpi"]["selected_cpi"])
+async def _ingest_category_series(category: str, category_id: int, *, keep=lambda raw: True) -> None:
+    """Fetch a FRED category's series and index each one's metadata into
+    Azure AI Search's fred-series index."""
+    series = await fred_service.get_category_series(category_id)
+    documents = [
+        _to_fred_series_document(category, FredService.get_series_metadata(raw))
+        for raw in series
+        if keep(raw)
+    ]
+    if documents:
+        await azure_search_service.index_fred_series(documents)
+
+async def cpi() -> None:
+    await _ingest_category_series("cpi", cpi_id)
 
 @tool
-def search_fred_indicators(category: str, query: str = ""):
-    """Search stored FRED indicator metadata for a category.
+async def search_fred_indicators(category: str, query: str = ""):
+    """Semantically search FRED indicator metadata for a category via Azure AI Search.
 
     `category` is one of cpi/ppi/gdp/shared_gdp/unemployment_rate, or an
     interest-rate sector name (see interest_rate() for the available names).
-    `query`, if given, filters by a case-insensitive substring match against
-    the indicator title.
+    `query`, if given (e.g. "important inflation indicators"), ranks results
+    semantically; if empty, returns all indicators in the category.
     """
-    collection = _resolve_indicator_collection(category)
-    mongo_filter = {"title": {"$regex": query, "$options": "i"}} if query else {}
-    return list(collection.find(mongo_filter, {"_id": 0}))
+    return await azure_search_service.search_fred_series(query or "*", category=category)
 
 @tool
 async def get_fred_observations(series_id: str, start_date: str | None = None, end_date: str | None = None):
@@ -130,166 +130,129 @@ async def get_fred_observations(series_id: str, start_date: str | None = None, e
     """
     return await fred_service.get_series_observations(series_id, observation_start=start_date, observation_end=end_date)
 
-async def _ingest_category_series(collection, category_id, *, keep=lambda raw: True):
-    """Fetch a FRED category's series and insert each one's metadata into `collection`."""
-    series = await fred_service.get_category_series(category_id)
-    for raw in series:
-        if keep(raw):
-            collection.insert_one(FredService.get_series_metadata(raw))
-
-async def cpi():
-    await _ingest_category_series(client["cpi"]["cpi"], cpi_id)
-
-async def selector_cpi():
+async def selector_cpi() -> None:
     await cpi()
     model = ChatOpenAI(model="gpt-5-mini-2025-08-07")
     agent = create_agent(model, response_format=ListFredSeriesMetadata, tools=[search_fred_indicators])
-    db = client["cpi"]
-    result = agent.invoke({"messages": [{"role": "user", "content": (
+    result = await agent.ainvoke({"messages": [{"role": "user", "content": (
                         "Select the best 3 indicators to represent the CPI. "
                         "You MUST call search_fred_indicators with category='cpi' "
                         "and only use those indicators. "
                         "Explain why each indicator is chosen in the reason object.")}]})
-    docs = [item.model_dump() for item in result["structured_response"].list_metadata]
-    db["selected_cpi"].insert_many(docs)
+    await _index_observations_for_selection("cpi", result["structured_response"].list_metadata)
 
-async def observation_cpi():
-    await selector_cpi()
-    db = client["cpi"]
-    for obj in db["selected_cpi"].find():
-        data = await fred_service.get_series_observations(obj["metadata"]["id"])
-        db["selected_cpi"].update_one({"_id": obj["_id"]}, {"$set": {"data": data}})
+async def ppi() -> None:
+    await _ingest_category_series("ppi", ppi_id)
 
-async def ppi():
-    await _ingest_category_series(client["ppi"]["ppi"], ppi_id)
-
-async def observation_ppi():
-    db = client["ppi"]
-    for obj in db["ppi"].find({}, {"_id": 0}):
+async def observation_ppi() -> None:
+    """No LLM selection for PPI -- index observations for every ingested indicator."""
+    for indicator in await azure_search_service.get_fred_series("ppi"):
         await asyncio.sleep(0.25)
-        data = await fred_service.get_series_observations(obj["id"])
-        db["selected_ppi"].insert_one({"metadata": obj, "data": data})
+        data = await fred_service.get_series_observations(indicator["series_id"])
+        documents = _to_fred_observation_documents("ppi", [{"metadata": {"id": indicator["series_id"]}, "data": data}])
+        if documents:
+            await azure_search_service.index_fred_observations(documents)
 
-async def interest_rate():
-    db = client["interest_rate"]
+async def interest_rate() -> list[str]:
+    """Ingests every interest-rate sector's series, keyed by sector name as
+    the fred-series `category`. Returns the sector names discovered, since
+    there's no Mongo collection listing to derive them from anymore."""
     categories = await fred_service.get_category_children(interest_rate_id)
-    for category in categories:
-        name = category["name"].replace(" ", "_")
-        series = await fred_service.get_category_series(category["id"])
-        for raw in series:
-            db[name].insert_one(FredService.get_series_metadata(raw))
+    sector_names = [category["name"].replace(" ", "_") for category in categories]
+    for category, sector_name in zip(categories, sector_names):
+        await _ingest_category_series(sector_name, category["id"])
+    return sector_names
 
-async def selector_interest_rate():
+async def selector_interest_rate() -> None:
+    sector_names = await interest_rate()
     model = ChatOpenAI(model="gpt-5-mini-2025-08-07")
     agent = create_agent(model, response_format=ListFredSeriesMetadata, tools=[search_fred_indicators])
-    source_db = client["interest_rate"]
-    target_db = client["selected_interest_rate"]
-    tasks = []
+
+    async def select_sector(rate: str) -> None:
+        result = await agent.ainvoke({"messages": [{"role": "user", "content": (
+                    f"Select the best 2 indicators to represent the '{rate}' rate. "
+                    f"You MUST call search_fred_indicators with category='{rate}' "
+                    f"and only use those indicators. "
+                    f"If '{rate}' is not an important rate to analysis economy pick 0 or 1 indicator"
+                    f"Explain why each indicator is chosen in the reason object.")}]})
+        await _index_observations_for_selection(rate, result["structured_response"].list_metadata)
+
     async with asyncio.TaskGroup() as tg:
-        for rate in source_db.list_collection_names():
-            task = tg.create_task(agent.ainvoke({"messages": [{"role": "user", "content": (
-                        f"Select the best 2 indicators to represent the '{rate}' rate. "
-                        f"You MUST call search_fred_indicators with category='{rate}' "
-                        f"and only use those indicators. "
-                        f"If '{rate}' is not an important rate to analysis economy pick 0 or 1 indicator"
-                        f"Explain why each indicator is chosen in the reason object.")}]}))
-            tasks.append((rate, task))
+        for rate in sector_names:
+            tg.create_task(select_sector(rate))
 
-    for rate, task in tasks:
-        result = task.result()
-        structured = result["structured_response"]
-        docs = [item.model_dump() for item in structured.list_metadata]
-        if docs:
-            target_db[rate].insert_many(docs)
-
-async def observation_interest_rate():
-    db = client["selected_interest_rate"]
-    for collection in db.list_collection_names():
-        for obj in db[collection].find({}):
-            try:
-                data = await fred_service.get_series_observations(obj["metadata"]["id"])
-            except FredApiError as error:
-                print("Bad response for:", obj["metadata"]["id"])
-                print(error)
-                continue
-            db[collection].update_one({"_id": obj["_id"]}, {"$set": {"data": data}})
-
-async def unemployment_rate():
+async def unemployment_rate() -> None:
     await _ingest_category_series(
-        client["unemployment_rate"]["unemployment_rate"],
+        "unemployment_rate",
         unemployment_rate_id,
         keep=lambda raw: raw["id"].startswith("UNRATE"),
     )
 
-async def observation_unemployment_rate():
+async def observation_unemployment_rate() -> None:
+    """No LLM selection for unemployment rate -- index observations for every ingested indicator."""
     await unemployment_rate()
-    db = client["unemployment_rate"]
-    for obj in db["unemployment_rate"].find({}, {"_id": 0}):
-        data = await fred_service.get_series_observations(obj["id"])
-        db["selected_unemployment_rate"].insert_one({"metadata": obj, "data": data})
+    for indicator in await azure_search_service.get_fred_series("unemployment_rate"):
+        data = await fred_service.get_series_observations(indicator["series_id"])
+        documents = _to_fred_observation_documents(
+            "unemployment_rate", [{"metadata": {"id": indicator["series_id"]}, "data": data}]
+        )
+        if documents:
+            await azure_search_service.index_fred_observations(documents)
 
-async def gdp():
-    await _ingest_category_series(client["gdp"]["gdp"], gdp_id)
+async def gdp() -> None:
+    await _ingest_category_series("gdp", gdp_id)
 
-async def shared_gdp():
-    await _ingest_category_series(client["gdp"]["shared_gdp"], shared_gdp_id)
+async def shared_gdp() -> None:
+    await _ingest_category_series("shared_gdp", shared_gdp_id)
 
-async def _refresh_observations_upsert(source_collection, target_collection):
-    """Fetch fresh observations for each doc in `source_collection` and upsert into `target_collection`."""
-    for obj in source_collection.find({}, {"_id": 0}):
+async def _refresh_observations(category: str) -> None:
+    """No LLM selection for gdp/shared_gdp -- refresh observations for every
+    ingested indicator in the category, tolerating individual bad responses."""
+    for indicator in await azure_search_service.get_fred_series(category):
         await asyncio.sleep(0.25)
         try:
-            data = await fred_service.get_series_observations(obj["id"])
+            data = await fred_service.get_series_observations(indicator["series_id"])
         except FredApiError as error:
-            print("Bad response for:", obj["id"])
+            print("Bad response for:", indicator["series_id"])
             print(error)
             continue
-        target_collection.update_one(
-            {"metadata.id": obj["id"]},
-            {"$set": {"metadata": obj, "data": data}},
-            upsert=True,
-        )
+        documents = _to_fred_observation_documents(category, [{"metadata": {"id": indicator["series_id"]}, "data": data}])
+        if documents:
+            await azure_search_service.index_fred_observations(documents)
 
-async def observation_gdp():
+async def observation_gdp() -> None:
     # await gdp()
-    db = client["gdp"]
-    await _refresh_observations_upsert(db["gdp"], db["selected_gdp"])
+    await _refresh_observations("gdp")
 
-async def observation_shared_gdp():
+async def observation_shared_gdp() -> None:
     # await shared_gdp()
-    db = client["gdp"]
-    await _refresh_observations_upsert(db["shared_gdp"], db["selected_shared_gdp"])
+    await _refresh_observations("shared_gdp")
 
-async def sandbox_cpi():
-    db = client["cpi"]
-    data = list(db["selected_cpi"].find({}, {"_id": 0}))
+async def sandbox_cpi() -> None:
+    data = await _build_indicator_dataset("cpi")
     await daytona_service.generate_economic_report("cpi", [DatasetFile("data.json", data)])
 
-async def sandbox_ppi():
-    db = client["ppi"]
-    data = list(db["selected_ppi"].find({}, {"_id": 0}))
+async def sandbox_ppi() -> None:
+    data = await _build_indicator_dataset("ppi")
     await daytona_service.generate_economic_report("ppi", [DatasetFile("data.json", data)])
 
-async def sandbox_interest_rate():
-    db = client["selected_interest_rate"]
-    datasets = [
-        DatasetFile("data.json1", list(db["FRB_Rates_-_discount,_fed_funds,_primary_credit"].find({}, {"_id": 0}))),
-        DatasetFile("data.json2", list(db["Monetary_Policy"].find({}, {"_id": 0}))),
-        DatasetFile("data.json3", list(db["Treasury_Bills"].find({}, {"_id": 0}))),
-        DatasetFile("data.json4", list(db["Treasury_Inflation-Indexed_Securities"].find({}, {"_id": 0}))),
-    ]
+async def sandbox_interest_rate() -> None:
+    # Sector names are discovered dynamically (Azure AI Search facets have no
+    # concept of "interest rate sector" grouping the way separate Mongo
+    # collections did), so this re-ingests (idempotent) rather than assuming
+    # a fixed, hardcoded sector list.
+    sector_names = await interest_rate()
+    datasets = [DatasetFile(f"data_{sector}.json", await _build_indicator_dataset(sector)) for sector in sector_names]
     await daytona_service.generate_economic_report("interest_rate", datasets)
 
-async def sandbox_unemployment_rate():
-    db = client["unemployment_rate"]
-    data = list(db["selected_unemployment_rate"].find({}, {"_id": 0}))
+async def sandbox_unemployment_rate() -> None:
+    data = await _build_indicator_dataset("unemployment_rate")
     await daytona_service.generate_economic_report("unemployment_rate", [DatasetFile("data.json", data)])
 
-async def sandbox_gdp():
-    db = client["gdp"]
+async def sandbox_gdp() -> None:
     datasets = [
-        DatasetFile("data.json1", list(db["selected_gdp"].find({}, {"_id": 0}))),
-        DatasetFile("data.json2", list(db["selected_shared_gdp"].find({}, {"_id": 0}))),
+        DatasetFile("data.json1", await _build_indicator_dataset("gdp")),
+        DatasetFile("data.json2", await _build_indicator_dataset("shared_gdp")),
     ]
     await daytona_service.generate_economic_report("gdp", datasets)
 

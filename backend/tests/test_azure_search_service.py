@@ -154,3 +154,27 @@ async def test_get_fred_observations_escapes_quotes_in_series_id():
 
     call = search_clients["fred-observations"].search_calls[0]
     assert call["filter"] == "series_id eq 'O''BRIEN'"
+
+
+@pytest.mark.asyncio
+async def test_get_fred_series_filters_by_category_only():
+    service, search_clients, _index_clients = make_service(docs=[{"series_id": "CPIAUCSL"}])
+
+    result = await service.get_fred_series("cpi")
+
+    call = search_clients["fred-series"].search_calls[0]
+    assert call["filter"] == "category eq 'cpi'"
+    assert "query_type" not in call
+    assert result == [{"series_id": "CPIAUCSL"}]
+
+
+@pytest.mark.asyncio
+async def test_get_observations_by_category_filters_and_orders():
+    service, search_clients, _index_clients = make_service(docs=[{"series_id": "CPIAUCSL", "date": "2024-01-01"}])
+
+    result = await service.get_observations_by_category("cpi")
+
+    call = search_clients["fred-observations"].search_calls[0]
+    assert call["filter"] == "category eq 'cpi'"
+    assert call["order_by"] == ["series_id asc", "date asc"]
+    assert result == [{"series_id": "CPIAUCSL", "date": "2024-01-01"}]
