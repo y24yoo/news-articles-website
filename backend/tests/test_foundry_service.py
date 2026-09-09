@@ -47,7 +47,21 @@ async def test_ask_passes_name_and_instructions_to_as_agent():
 
     await service.ask("ping")
 
-    assert chat_client.as_agent_calls == [{"name": "my-agent", "instructions": "Be terse."}]
+    assert chat_client.as_agent_calls == [{"name": "my-agent", "instructions": "Be terse.", "tools": None}]
+
+
+@pytest.mark.asyncio
+async def test_ask_passes_tools_to_as_agent():
+    chat_client = FakeChatClient()
+
+    def one_plus_one():
+        return 2
+
+    service = FoundryService(chat_client_factory=lambda: chat_client, tools=[one_plus_one])
+
+    await service.ask("ping")
+
+    assert chat_client.as_agent_calls[0]["tools"] == [one_plus_one]
 
 
 @pytest.mark.asyncio

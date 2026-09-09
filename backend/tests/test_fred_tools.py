@@ -75,9 +75,11 @@ class FakeAzureSearchService:
 class FakeDaytonaService:
     def __init__(self):
         self.calls = []
+        self.report_path = "indicators/cpi/report.html"
 
     async def generate_economic_report(self, indicator_type, datasets):
         self.calls.append((indicator_type, datasets))
+        return self.report_path
 
 
 class FakeAgent:
@@ -217,6 +219,24 @@ async def test_build_indicator_dataset_merges_metadata_with_observations(monkeyp
         },
         {"series_id": "CPILFESL", "title": "Core CPI", "category": "cpi", "data": []},
     ]
+
+
+@pytest.mark.asyncio
+async def test_run_economic_analysis_builds_dataset_and_calls_daytona(monkeypatch):
+    fake_search = FakeAzureSearchService(
+        fred_series_by_category={"cpi": [{"series_id": "CPIAUCSL", "title": "CPI", "category": "cpi"}]},
+        observations_by_category={"cpi": [{"series_id": "CPIAUCSL", "date": "2024-01-01", "value": "1.0", "category": "cpi"}]},
+    )
+    fake_daytona = FakeDaytonaService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+    monkeypatch.setattr(fred, "daytona_service", fake_daytona)
+
+    result = await fred.run_economic_analysis("cpi")
+
+    indicator_type, datasets = fake_daytona.calls[0]
+    assert indicator_type == "cpi"
+    assert [d.filename for d in datasets] == ["data.json"]
+    assert result == fake_daytona.report_path
 
 
 @pytest.mark.asyncio

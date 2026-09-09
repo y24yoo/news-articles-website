@@ -86,6 +86,17 @@ async def _build_indicator_dataset(category: str) -> list[dict]:
         for metadata in series_metadata
     ]
 
+async def run_economic_analysis(category: str) -> str:
+    """Run Daytona-based statistics/chart/report generation over a category's
+    indexed indicator data. This is the "Analysis Tool" from AGENTS.md's
+    Agent Design section -- pure numeric analysis, no research bundled in
+    (that's ResearchAgent's job; see backend/agents/). Returns the path to
+    the generated report.html.
+    """
+    data = await _build_indicator_dataset(category)
+    report_path = await daytona_service.generate_economic_report(category, [DatasetFile("data.json", data)])
+    return str(report_path)
+
 async def _index_observations_for_selection(category: str, selected: list[Reason]) -> None:
     """Fetch live FRED observations for each LLM-selected indicator and index
     them into fred-observations."""
