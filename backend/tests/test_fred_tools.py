@@ -31,13 +31,22 @@ class FakeFredService:
 
 
 class FakeAzureSearchService:
-    def __init__(self, fred_series_by_category=None, observations_by_category=None, search_results=None):
+    def __init__(
+        self,
+        fred_series_by_category=None,
+        observations_by_category=None,
+        search_results=None,
+        economic_document_results=None,
+    ):
         self.fred_series_docs = []
         self.fred_observations_docs = []
+        self.economic_documents = []
         self.search_calls = []
+        self.economic_document_search_calls = []
         self._search_results = search_results or []
         self._fred_series_by_category = fred_series_by_category or {}
         self._observations_by_category = observations_by_category or {}
+        self._economic_document_results = economic_document_results or []
 
     async def index_fred_series(self, documents):
         self.fred_series_docs.extend(documents)
@@ -54,6 +63,13 @@ class FakeAzureSearchService:
 
     async def get_observations_by_category(self, category):
         return self._observations_by_category.get(category, [])
+
+    async def index_economic_documents(self, documents):
+        self.economic_documents.extend(documents)
+
+    async def search_economic_documents(self, query, top=5):
+        self.economic_document_search_calls.append((query, top))
+        return self._economic_document_results
 
 
 class FakeDaytonaService:
@@ -386,8 +402,9 @@ async def test_sandbox_cpi_builds_dataset_and_calls_daytona(monkeypatch):
     assert len(fake_daytona.calls) == 1
     indicator_type, datasets = fake_daytona.calls[0]
     assert indicator_type == "cpi"
-    assert [d.filename for d in datasets] == ["data.json"]
+    assert [d.filename for d in datasets] == ["data.json", "research.json"]
     assert datasets[0].data[0]["series_id"] == "CPIAUCSL"
+    assert len(fake_search.economic_document_search_calls) == 1
 
 
 @pytest.mark.asyncio
@@ -407,7 +424,7 @@ async def test_sandbox_gdp_builds_two_datasets(monkeypatch):
 
     indicator_type, datasets = fake_daytona.calls[0]
     assert indicator_type == "gdp"
-    assert [d.filename for d in datasets] == ["data.json1", "data.json2"]
+    assert [d.filename for d in datasets] == ["data.json1", "data.json2", "research.json"]
 
 
 @pytest.mark.asyncio
@@ -431,7 +448,7 @@ async def test_sandbox_interest_rate_builds_one_dataset_per_discovered_sector(mo
 
     indicator_type, datasets = fake_daytona.calls[0]
     assert indicator_type == "interest_rate"
-    assert [d.filename for d in datasets] == ["data_Treasury_Bills.json"]
+    assert [d.filename for d in datasets] == ["data_Treasury_Bills.json", "research.json"]
 
 
 # --- LLM-driven selection --------------------------------------------------------
@@ -494,3 +511,58 @@ async def test_selector_interest_rate_selects_and_indexes_per_sector(monkeypatch
         {"id": "TB3MS_2024-01-01", "series_id": "TB3MS", "date": "2024-01-01", "value": "5.0", "category": "Treasury_Bills"}
     ]
     assert "category='Treasury_Bills'" in fake_agent.prompts[0]
+
+
+# --- Phase 6: RAG over economic documents ---------------------------------------
+
+
+class FakeFirecrawlService:
+    def __init__(self, documents=None):
+        self._documents = documents or []
+        self.search_calls = []
+
+    async def search_economic_news(self, query, limit=5):
+        self.search_calls.append((query, limit))
+        return self._documents
+
+
+@pytest.mark.asyncio
+async def test_search_economic_documents_delegates_to_azure_search(monkeypatch):
+    fake_search = FakeAzureSearchService(
+        economic_document_results=[{"id": "abc", "title": "Fed holds rates steady"}]
+    )
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+
+    result = await fred.search_economic_documents.ainvoke({"query": "federal reserve rate decision"})
+
+    assert result == [{"id": "abc", "title": "Fed holds rates steady"}]
+    assert fake_search.economic_document_search_calls == [("federal reserve rate decision", 5)]
+
+
+@pytest.mark.asyncio
+async def test_index_economic_news_indexes_fetched_documents(monkeypatch):
+    fake_firecrawl = FakeFirecrawlService(documents=[
+        {"id": "abc", "title": "Fed holds rates steady", "content": "...", "source": "https://example.com"},
+    ])
+    fake_search = FakeAzureSearchService()
+    monkeypatch.setattr(fred, "firecrawl_service", fake_firecrawl)
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+
+    await fred.index_economic_news("inflation news", limit=3)
+
+    assert fake_firecrawl.search_calls == [("inflation news", 3)]
+    assert fake_search.economic_documents == [
+        {"id": "abc", "title": "Fed holds rates steady", "content": "...", "source": "https://example.com"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_index_economic_news_skips_indexing_when_nothing_found(monkeypatch):
+    fake_firecrawl = FakeFirecrawlService(documents=[])
+    fake_search = FakeAzureSearchService()
+    monkeypatch.setattr(fred, "firecrawl_service", fake_firecrawl)
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+
+    await fred.index_economic_news()
+
+    assert fake_search.economic_documents == []

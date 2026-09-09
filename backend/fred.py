@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from api_key import fred_api
+from api_key import firecrawl_api, fred_api
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool
@@ -11,6 +11,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 from services.azure_search_service import AzureSearchService
 from services.daytona_service import DatasetFile, DaytonaService
+from services.firecrawl_service import FirecrawlService
 from services.fred_service import FredApiError, FredService
 
 
@@ -35,6 +36,7 @@ load_dotenv()
 fred_service = FredService(api_key=fred_api)
 daytona_service = DaytonaService()
 azure_search_service = AzureSearchService()
+firecrawl_service = FirecrawlService(api_key=firecrawl_api)
 cpi_id = 9
 ppi_id = 31
 interest_rate_id = 22
@@ -129,6 +131,28 @@ async def get_fred_observations(series_id: str, start_date: str | None = None, e
     (start_date defaults to a multi-year lookback, end_date to "today").
     """
     return await fred_service.get_series_observations(series_id, observation_start=start_date, observation_end=end_date)
+
+@tool
+async def search_economic_documents(query: str):
+    """Hybrid search (keyword + vector + semantic reranking) over indexed
+    economic research/news documents -- Federal Reserve releases, FOMC
+    statements, BLS/BEA content, economic news, and Firecrawl content.
+    """
+    return await azure_search_service.search_economic_documents(query)
+
+async def index_economic_news(
+    query: str = "latest economic news inflation jobs markets central banks",
+    limit: int = 5,
+) -> None:
+    """Phase 6: fetch recent economic news via Firecrawl and index it into
+    economic-documents for RAG. Covers the "economic news" / "Firecrawl
+    content" sources from AGENTS.md's economic-documents spec; Federal
+    Reserve releases, FOMC statements, and BLS/BEA content are not sourced
+    by this function (no specific feed/URL for them is wired up yet).
+    """
+    documents = await firecrawl_service.search_economic_news(query, limit=limit)
+    if documents:
+        await azure_search_service.index_economic_documents(documents)
 
 async def selector_cpi() -> None:
     await cpi()
@@ -230,11 +254,13 @@ async def observation_shared_gdp() -> None:
 
 async def sandbox_cpi() -> None:
     data = await _build_indicator_dataset("cpi")
-    await daytona_service.generate_economic_report("cpi", [DatasetFile("data.json", data)])
+    research = await azure_search_service.search_economic_documents("CPI inflation trends and analysis")
+    await daytona_service.generate_economic_report("cpi", [DatasetFile("data.json", data), DatasetFile("research.json", research)])
 
 async def sandbox_ppi() -> None:
     data = await _build_indicator_dataset("ppi")
-    await daytona_service.generate_economic_report("ppi", [DatasetFile("data.json", data)])
+    research = await azure_search_service.search_economic_documents("PPI producer price inflation trends and analysis")
+    await daytona_service.generate_economic_report("ppi", [DatasetFile("data.json", data), DatasetFile("research.json", research)])
 
 async def sandbox_interest_rate() -> None:
     # Sector names are discovered dynamically (Azure AI Search facets have no
@@ -243,16 +269,23 @@ async def sandbox_interest_rate() -> None:
     # a fixed, hardcoded sector list.
     sector_names = await interest_rate()
     datasets = [DatasetFile(f"data_{sector}.json", await _build_indicator_dataset(sector)) for sector in sector_names]
+    research = await azure_search_service.search_economic_documents("interest rate monetary policy trends and analysis")
+    datasets.append(DatasetFile("research.json", research))
     await daytona_service.generate_economic_report("interest_rate", datasets)
 
 async def sandbox_unemployment_rate() -> None:
     data = await _build_indicator_dataset("unemployment_rate")
-    await daytona_service.generate_economic_report("unemployment_rate", [DatasetFile("data.json", data)])
+    research = await azure_search_service.search_economic_documents("unemployment labor market trends and analysis")
+    await daytona_service.generate_economic_report(
+        "unemployment_rate", [DatasetFile("data.json", data), DatasetFile("research.json", research)]
+    )
 
 async def sandbox_gdp() -> None:
+    research = await azure_search_service.search_economic_documents("GDP economic growth trends and analysis")
     datasets = [
         DatasetFile("data.json1", await _build_indicator_dataset("gdp")),
         DatasetFile("data.json2", await _build_indicator_dataset("shared_gdp")),
+        DatasetFile("research.json", research),
     ]
     await daytona_service.generate_economic_report("gdp", datasets)
 
