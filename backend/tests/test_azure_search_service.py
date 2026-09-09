@@ -48,6 +48,20 @@ class FakeIndexClient:
         return index
 
 
+class FakeEmbedding:
+    def __init__(self, vector):
+        self.vector = vector
+
+
+class FakeEmbeddingClient:
+    def __init__(self):
+        self.embed_calls = []
+
+    async def get_embeddings(self, values):
+        self.embed_calls.append(list(values))
+        return [FakeEmbedding([0.1, 0.2, 0.3]) for _ in values]
+
+
 def make_service(**kwargs):
     search_clients = {}
 
@@ -63,13 +77,16 @@ def make_service(**kwargs):
         index_clients.append(client)
         return client
 
+    embedding_client = kwargs.get("embedding_client") or FakeEmbeddingClient()
+
     service = AzureSearchService(
         endpoint="https://example.search.windows.net",
         credential_factory=lambda: "fake-credential",
         index_client_factory=index_client_factory,
         search_client_factory=search_client_factory,
+        embedding_client_factory=lambda: embedding_client,
     )
-    return service, search_clients, index_clients
+    return service, search_clients, index_clients, embedding_client
 
 
 def test_index_builders_use_configured_names():
@@ -86,7 +103,7 @@ def test_service_reads_index_names_from_env(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ensure_indexes_creates_all_three():
-    service, _search_clients, index_clients = make_service()
+    service, _search_clients, index_clients, _embedding_client = make_service()
 
     await service.ensure_indexes()
 
@@ -97,7 +114,7 @@ async def test_ensure_indexes_creates_all_three():
 
 @pytest.mark.asyncio
 async def test_index_fred_series_uploads_to_the_right_client():
-    service, search_clients, _index_clients = make_service()
+    service, search_clients, _index_clients, _embedding_client = make_service()
     docs = [{"series_id": "CPIAUCSL", "title": "CPI"}]
 
     await service.index_fred_series(docs)
@@ -107,7 +124,7 @@ async def test_index_fred_series_uploads_to_the_right_client():
 
 @pytest.mark.asyncio
 async def test_index_fred_observations_uploads_to_the_right_client():
-    service, search_clients, _index_clients = make_service()
+    service, search_clients, _index_clients, _embedding_client = make_service()
     docs = [{"id": "CPIAUCSL_2024-01-01", "series_id": "CPIAUCSL", "date": "2024-01-01", "value": "1.0"}]
 
     await service.index_fred_observations(docs)
@@ -117,7 +134,7 @@ async def test_index_fred_observations_uploads_to_the_right_client():
 
 @pytest.mark.asyncio
 async def test_search_fred_series_uses_semantic_query_type():
-    service, search_clients, _index_clients = make_service(docs=[{"series_id": "CPIAUCSL"}])
+    service, search_clients, _index_clients, _embedding_client = make_service(docs=[{"series_id": "CPIAUCSL"}])
 
     result = await service.search_fred_series("important inflation indicators", category="cpi")
 
@@ -129,7 +146,7 @@ async def test_search_fred_series_uses_semantic_query_type():
 
 @pytest.mark.asyncio
 async def test_search_fred_series_without_category_omits_filter():
-    service, search_clients, _index_clients = make_service()
+    service, search_clients, _index_clients, _embedding_client = make_service()
 
     await service.search_fred_series("inflation")
 
@@ -138,7 +155,7 @@ async def test_search_fred_series_without_category_omits_filter():
 
 @pytest.mark.asyncio
 async def test_get_fred_observations_builds_filter_from_dates():
-    service, search_clients, _index_clients = make_service()
+    service, search_clients, _index_clients, _embedding_client = make_service()
 
     await service.get_fred_observations("CPIAUCSL", start_date="2020-01-01", end_date="2024-01-01")
 
@@ -148,7 +165,7 @@ async def test_get_fred_observations_builds_filter_from_dates():
 
 @pytest.mark.asyncio
 async def test_get_fred_observations_escapes_quotes_in_series_id():
-    service, search_clients, _index_clients = make_service()
+    service, search_clients, _index_clients, _embedding_client = make_service()
 
     await service.get_fred_observations("O'BRIEN")
 
@@ -158,7 +175,7 @@ async def test_get_fred_observations_escapes_quotes_in_series_id():
 
 @pytest.mark.asyncio
 async def test_get_fred_series_filters_by_category_only():
-    service, search_clients, _index_clients = make_service(docs=[{"series_id": "CPIAUCSL"}])
+    service, search_clients, _index_clients, _embedding_client = make_service(docs=[{"series_id": "CPIAUCSL"}])
 
     result = await service.get_fred_series("cpi")
 
@@ -170,7 +187,7 @@ async def test_get_fred_series_filters_by_category_only():
 
 @pytest.mark.asyncio
 async def test_get_observations_by_category_filters_and_orders():
-    service, search_clients, _index_clients = make_service(docs=[{"series_id": "CPIAUCSL", "date": "2024-01-01"}])
+    service, search_clients, _index_clients, _embedding_client = make_service(docs=[{"series_id": "CPIAUCSL", "date": "2024-01-01"}])
 
     result = await service.get_observations_by_category("cpi")
 
@@ -178,3 +195,57 @@ async def test_get_observations_by_category_filters_and_orders():
     assert call["filter"] == "category eq 'cpi'"
     assert call["order_by"] == ["series_id asc", "date asc"]
     assert result == [{"series_id": "CPIAUCSL", "date": "2024-01-01"}]
+
+
+@pytest.mark.asyncio
+async def test_index_economic_documents_embeds_content_and_uploads():
+    service, search_clients, _index_clients, embedding_client = make_service()
+    docs = [{"id": "abc", "title": "Fed holds rates steady", "content": "The Federal Reserve...", "source": "https://example.com"}]
+
+    await service.index_economic_documents(docs)
+
+    assert embedding_client.embed_calls == [["The Federal Reserve..."]]
+    uploaded = search_clients["economic-documents"].uploaded
+    assert uploaded[0]["id"] == "abc"
+    assert uploaded[0]["content_vector"] == [0.1, 0.2, 0.3]
+
+
+@pytest.mark.asyncio
+async def test_search_economic_documents_uses_hybrid_vector_and_semantic_query():
+    service, search_clients, _index_clients, embedding_client = make_service(
+        docs=[{"id": "abc", "title": "Fed holds rates steady"}]
+    )
+
+    result = await service.search_economic_documents("federal reserve interest rate decision", top=3)
+
+    assert embedding_client.embed_calls == [["federal reserve interest rate decision"]]
+    call = search_clients["economic-documents"].search_calls[0]
+    assert call["search_text"] == "federal reserve interest rate decision"
+    assert call["query_type"] == "semantic"
+    assert len(call["vector_queries"]) == 1
+    vector_query = call["vector_queries"][0]
+    assert vector_query.vector == [0.1, 0.2, 0.3]
+    assert vector_query.fields == "content_vector"
+    assert vector_query.k_nearest_neighbors == 3
+    assert result == [{"id": "abc", "title": "Fed holds rates steady"}]
+
+
+@pytest.mark.asyncio
+async def test_embedding_client_is_created_lazily_once():
+    calls = []
+
+    def embedding_factory():
+        calls.append(1)
+        return FakeEmbeddingClient()
+
+    service = AzureSearchService(
+        endpoint="https://example.search.windows.net",
+        credential_factory=lambda: "fake-credential",
+        search_client_factory=lambda endpoint, index_name, credential: FakeSearchClient(endpoint, index_name, credential),
+        embedding_client_factory=embedding_factory,
+    )
+
+    await service.search_economic_documents("first")
+    await service.search_economic_documents("second")
+
+    assert len(calls) == 1

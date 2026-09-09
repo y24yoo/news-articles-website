@@ -139,6 +139,15 @@ def _default_credential_factory() -> Any:
     return DefaultAzureCredential()
 
 
+def _default_embedding_client_factory() -> Any:
+    from agent_framework_foundry import FoundryEmbeddingClient
+    from azure.identity.aio import DefaultAzureCredential
+
+    # Reads FOUNDRY_MODELS_ENDPOINT / FOUNDRY_EMBEDDING_MODEL from the
+    # environment itself (see backend/.env.example).
+    return FoundryEmbeddingClient(credential=DefaultAzureCredential())
+
+
 def _default_index_client_factory(endpoint: str, credential: Any) -> Any:
     from azure.search.documents.indexes.aio import SearchIndexClient
 
@@ -170,6 +179,7 @@ class AzureSearchService:
         credential_factory: Callable[[], Any] = _default_credential_factory,
         index_client_factory: Callable[[str, Any], Any] = _default_index_client_factory,
         search_client_factory: Callable[[str, str, Any], Any] = _default_search_client_factory,
+        embedding_client_factory: Callable[[], Any] = _default_embedding_client_factory,
     ):
         self._endpoint = endpoint or os.environ.get("AZURE_SEARCH_ENDPOINT")
         self.fred_series_index = fred_series_index or os.environ.get(
@@ -184,7 +194,9 @@ class AzureSearchService:
         self._credential_factory = credential_factory
         self._index_client_factory = index_client_factory
         self._search_client_factory = search_client_factory
+        self._embedding_client_factory = embedding_client_factory
         self._search_clients: dict[str, Any] = {}
+        self._embedding_client: Any = None
 
     def _get_search_client(self, index_name: str) -> Any:
         if index_name not in self._search_clients:
@@ -192,6 +204,12 @@ class AzureSearchService:
                 self._endpoint, index_name, self._credential_factory()
             )
         return self._search_clients[index_name]
+
+    async def _embed_text(self, text: str) -> list[float]:
+        if self._embedding_client is None:
+            self._embedding_client = self._embedding_client_factory()
+        embeddings = await self._embedding_client.get_embeddings([text])
+        return embeddings[0].vector
 
     async def ensure_indexes(self) -> None:
         """Create (or update) all three indexes."""
@@ -261,5 +279,33 @@ class AzureSearchService:
             search_text="*",
             filter=f"category eq '{_escape_odata_literal(category)}'",
             order_by=["series_id asc", "date asc"],
+        )
+        return [doc async for doc in results]
+
+    async def index_economic_documents(self, documents: Sequence[dict]) -> Any:
+        """Embed each document's `content` and upload/merge into economic-documents.
+
+        Each document needs at least `id` and `content`; `title`, `source`,
+        and `published_at` are optional per the index schema.
+        """
+        enriched = []
+        for doc in documents:
+            vector = await self._embed_text(doc["content"])
+            enriched.append({**doc, "content_vector": vector})
+        client = self._get_search_client(self.economic_documents_index)
+        return await client.merge_or_upload_documents(enriched)
+
+    async def search_economic_documents(self, query: str, top: int = 5) -> list[dict]:
+        """Hybrid retrieval over economic-documents: keyword + vector + semantic reranking."""
+        from azure.search.documents.models import VectorizedQuery
+
+        vector = await self._embed_text(query)
+        client = self._get_search_client(self.economic_documents_index)
+        results = await client.search(
+            search_text=query,
+            vector_queries=[VectorizedQuery(vector=vector, k_nearest_neighbors=top, fields="content_vector")],
+            query_type="semantic",
+            semantic_configuration_name=_ECONOMIC_DOCUMENTS_SEMANTIC_CONFIG,
+            top=top,
         )
         return [doc async for doc in results]
