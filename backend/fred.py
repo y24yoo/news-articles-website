@@ -11,6 +11,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 from services.azure_search_service import AzureSearchService
 from services.daytona_service import DatasetFile, DaytonaService
+from services.evaluation_service import EvaluationService
 from services.firecrawl_service import FirecrawlService
 from services.fred_service import FredApiError, FredService
 
@@ -37,6 +38,7 @@ fred_service = FredService(api_key=fred_api)
 daytona_service = DaytonaService()
 azure_search_service = AzureSearchService()
 firecrawl_service = FirecrawlService(api_key=firecrawl_api)
+evaluation_service = EvaluationService()
 cpi_id = 9
 ppi_id = 31
 interest_rate_id = 22
@@ -92,14 +94,31 @@ async def run_economic_analysis(category: str) -> str:
     Agent Design section -- pure numeric analysis, no research bundled in
     (that's ResearchAgent's job; see backend/agents/). Returns the path to
     the generated report.html.
+
+    Records Phase 8 metrics: tool-call success rate/latency, report
+    completion rate (did a report.html actually get produced), and HTML
+    validation success rate (does it meet the strict format rules).
     """
     data = await _build_indicator_dataset(category)
-    report_path = await daytona_service.generate_economic_report(category, [DatasetFile("data.json", data)])
+    async with evaluation_service.measure_tool_call("run_economic_analysis"):
+        report_path = await daytona_service.generate_economic_report(category, [DatasetFile("data.json", data)])
+    report_file = Path(report_path)
+    report_produced = report_file.exists()
+    evaluation_service.record_report_generation(report_produced)
+    if report_produced:
+        evaluation_service.validate_and_record_report(report_file.read_text(encoding="utf-8"))
     return str(report_path)
 
 async def _index_observations_for_selection(category: str, selected: list[Reason]) -> None:
     """Fetch live FRED observations for each LLM-selected indicator and index
-    them into fred-observations."""
+    them into fred-observations. Records Phase 8's indicator selection
+    accuracy: did the LLM pick from real, known indicators for the
+    category, or hallucinate a series_id?"""
+    known_series_ids = {doc["series_id"] for doc in await azure_search_service.get_fred_series(category)}
+    evaluation_service.record_indicator_selection(
+        selected_series_ids=[item.metadata.id for item in selected],
+        valid_series_ids=known_series_ids,
+    )
     selected_docs = []
     for item in selected:
         data = await fred_service.get_series_observations(item.metadata.id)
@@ -132,7 +151,10 @@ async def search_fred_indicators(category: str, query: str = ""):
     `query`, if given (e.g. "important inflation indicators"), ranks results
     semantically; if empty, returns all indicators in the category.
     """
-    return await azure_search_service.search_fred_series(query or "*", category=category)
+    async with evaluation_service.measure_tool_call("search_fred_indicators"):
+        results = await azure_search_service.search_fred_series(query or "*", category=category)
+    evaluation_service.record_retrieval_relevance("search_fred_indicators", results)
+    return results
 
 @tool
 async def get_fred_observations(series_id: str, start_date: str | None = None, end_date: str | None = None):
@@ -141,7 +163,10 @@ async def get_fred_observations(series_id: str, start_date: str | None = None, e
     `start_date`/`end_date` are "YYYY-MM-DD" strings; both are optional
     (start_date defaults to a multi-year lookback, end_date to "today").
     """
-    return await fred_service.get_series_observations(series_id, observation_start=start_date, observation_end=end_date)
+    async with evaluation_service.measure_tool_call("get_fred_observations"):
+        return await fred_service.get_series_observations(
+            series_id, observation_start=start_date, observation_end=end_date
+        )
 
 @tool
 async def search_economic_documents(query: str):
@@ -149,7 +174,10 @@ async def search_economic_documents(query: str):
     economic research/news documents -- Federal Reserve releases, FOMC
     statements, BLS/BEA content, economic news, and Firecrawl content.
     """
-    return await azure_search_service.search_economic_documents(query)
+    async with evaluation_service.measure_tool_call("search_economic_documents"):
+        results = await azure_search_service.search_economic_documents(query)
+    evaluation_service.record_retrieval_relevance("search_economic_documents", results)
+    return results
 
 async def index_economic_news(
     query: str = "latest economic news inflation jobs markets central banks",
