@@ -1,5 +1,6 @@
 import fred
 import pytest
+from services.evaluation_service import EvaluationService
 from services.fred_service import FredApiError
 
 
@@ -123,6 +124,21 @@ async def test_search_fred_indicators_passes_query_and_category_through(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_search_fred_indicators_records_tool_call_and_relevance(monkeypatch):
+    fake_search = FakeAzureSearchService(
+        search_results=[{"series_id": "CPIAUCSL", "@search.rerankerScore": 2.5}]
+    )
+    fake_eval = EvaluationService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+    monkeypatch.setattr(fred, "evaluation_service", fake_eval)
+
+    await fred.search_fred_indicators.ainvoke({"category": "cpi"})
+
+    assert fake_eval.tool_call_success_rate("search_fred_indicators") == 1.0
+    assert fake_eval.average_retrieval_relevance("search_fred_indicators") == 2.5
+
+
+@pytest.mark.asyncio
 async def test_get_fred_observations_passes_dates_to_fred_service(monkeypatch):
     fake_service = FakeFredService(observations_by_id={"CPIAUCSL": [{"date": "2024-01-01", "value": "1.0"}]})
     monkeypatch.setattr(fred, "fred_service", fake_service)
@@ -143,6 +159,31 @@ async def test_get_fred_observations_defaults_dates_to_none(monkeypatch):
     await fred.get_fred_observations.ainvoke({"series_id": "CPIAUCSL"})
 
     assert fake_service.observation_calls == [("CPIAUCSL", None, None)]
+
+
+@pytest.mark.asyncio
+async def test_get_fred_observations_records_tool_call_outcome(monkeypatch):
+    fake_service = FakeFredService(observations_by_id={"CPIAUCSL": []})
+    fake_eval = EvaluationService()
+    monkeypatch.setattr(fred, "fred_service", fake_service)
+    monkeypatch.setattr(fred, "evaluation_service", fake_eval)
+
+    await fred.get_fred_observations.ainvoke({"series_id": "CPIAUCSL"})
+
+    assert fake_eval.tool_call_success_rate("get_fred_observations") == 1.0
+
+
+@pytest.mark.asyncio
+async def test_get_fred_observations_records_failure_on_error(monkeypatch):
+    fake_service = FakeFredService(bad_series_ids={"BADSERIES"})
+    fake_eval = EvaluationService()
+    monkeypatch.setattr(fred, "fred_service", fake_service)
+    monkeypatch.setattr(fred, "evaluation_service", fake_eval)
+
+    with pytest.raises(FredApiError):
+        await fred.get_fred_observations.ainvoke({"series_id": "BADSERIES"})
+
+    assert fake_eval.tool_call_success_rate("get_fred_observations") == 0.0
 
 
 # --- pure mapping helpers -----------------------------------------------------
@@ -240,6 +281,41 @@ async def test_run_economic_analysis_builds_dataset_and_calls_daytona(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_run_economic_analysis_records_completion_and_validation_when_report_exists(monkeypatch, tmp_path):
+    report_file = tmp_path / "report.html"
+    report_file.write_text('<div class="prose">A real report</div>', encoding="utf-8")
+    fake_search = FakeAzureSearchService(fred_series_by_category={"cpi": []}, observations_by_category={"cpi": []})
+    fake_daytona = FakeDaytonaService()
+    fake_daytona.report_path = str(report_file)
+    fake_eval = EvaluationService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+    monkeypatch.setattr(fred, "daytona_service", fake_daytona)
+    monkeypatch.setattr(fred, "evaluation_service", fake_eval)
+
+    await fred.run_economic_analysis("cpi")
+
+    assert fake_eval.report_completion_rate() == 1.0
+    assert fake_eval.html_validation_success_rate() == 1.0
+    assert fake_eval.tool_call_success_rate("run_economic_analysis") == 1.0
+
+
+@pytest.mark.asyncio
+async def test_run_economic_analysis_records_incomplete_when_report_missing(monkeypatch):
+    fake_search = FakeAzureSearchService(fred_series_by_category={"cpi": []}, observations_by_category={"cpi": []})
+    fake_daytona = FakeDaytonaService()
+    fake_daytona.report_path = "does/not/exist/report.html"
+    fake_eval = EvaluationService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+    monkeypatch.setattr(fred, "daytona_service", fake_daytona)
+    monkeypatch.setattr(fred, "evaluation_service", fake_eval)
+
+    await fred.run_economic_analysis("cpi")
+
+    assert fake_eval.report_completion_rate() == 0.0
+    assert fake_eval.html_validation_success_rate() is None
+
+
+@pytest.mark.asyncio
 async def test_index_observations_for_selection_fetches_and_flattens(monkeypatch):
     fake_service = FakeFredService(
         observations_by_id={
@@ -247,7 +323,12 @@ async def test_index_observations_for_selection_fetches_and_flattens(monkeypatch
             "CPILFESL": [{"date": "2024-01-01", "value": "2.0"}],
         }
     )
-    fake_search = FakeAzureSearchService()
+    fake_search = FakeAzureSearchService(
+        fred_series_by_category={"cpi": [
+            {"series_id": "CPIAUCSL"},
+            {"series_id": "CPILFESL"},
+        ]}
+    )
     monkeypatch.setattr(fred, "fred_service", fake_service)
     monkeypatch.setattr(fred, "azure_search_service", fake_search)
 
@@ -262,6 +343,25 @@ async def test_index_observations_for_selection_fetches_and_flattens(monkeypatch
         {"id": "CPIAUCSL_2024-01-01", "series_id": "CPIAUCSL", "date": "2024-01-01", "value": "1.0", "category": "cpi"},
         {"id": "CPILFESL_2024-01-01", "series_id": "CPILFESL", "date": "2024-01-01", "value": "2.0", "category": "cpi"},
     ]
+
+
+@pytest.mark.asyncio
+async def test_index_observations_for_selection_records_selection_accuracy(monkeypatch):
+    fake_service = FakeFredService(observations_by_id={"CPIAUCSL": [], "MADEUP": []})
+    fake_search = FakeAzureSearchService(fred_series_by_category={"cpi": [{"series_id": "CPIAUCSL"}]})
+    fake_eval = EvaluationService()
+    monkeypatch.setattr(fred, "fred_service", fake_service)
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+    monkeypatch.setattr(fred, "evaluation_service", fake_eval)
+
+    selected = [
+        fred.Reason(metadata=cpi_metadata("CPIAUCSL", "CPI"), reason="headline"),
+        fred.Reason(metadata=cpi_metadata("MADEUP", "Hallucinated"), reason="not real"),
+    ]
+
+    await fred._index_observations_for_selection("cpi", selected)
+
+    assert fake_eval.indicator_selection_accuracy() == 0.5
 
 
 # --- ingestion -----------------------------------------------------------------
@@ -557,6 +657,21 @@ async def test_search_economic_documents_delegates_to_azure_search(monkeypatch):
 
     assert result == [{"id": "abc", "title": "Fed holds rates steady"}]
     assert fake_search.economic_document_search_calls == [("federal reserve rate decision", 5)]
+
+
+@pytest.mark.asyncio
+async def test_search_economic_documents_records_tool_call_and_relevance(monkeypatch):
+    fake_search = FakeAzureSearchService(
+        economic_document_results=[{"id": "abc", "@search.rerankerScore": 1.5}]
+    )
+    fake_eval = EvaluationService()
+    monkeypatch.setattr(fred, "azure_search_service", fake_search)
+    monkeypatch.setattr(fred, "evaluation_service", fake_eval)
+
+    await fred.search_economic_documents.ainvoke({"query": "federal reserve"})
+
+    assert fake_eval.tool_call_success_rate("search_economic_documents") == 1.0
+    assert fake_eval.average_retrieval_relevance("search_economic_documents") == 1.5
 
 
 @pytest.mark.asyncio

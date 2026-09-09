@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 
-from fred import run_economic_analysis
+from fred import evaluation_service, run_economic_analysis
 
 from agents.indicator_agent import select_indicators
 from agents.research_agent import research
@@ -35,3 +35,5 @@ async def run_report_pipeline(category: str) -> str:
 
 if __name__ == "__main__":
     print(asyncio.run(run_report_pipeline("cpi")))
+    # Phase 8: report the real metrics this run actually produced.
+    print(evaluation_service.summary())
