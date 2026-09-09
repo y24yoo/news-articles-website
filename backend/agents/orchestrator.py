@@ -11,17 +11,21 @@ that step -- see services/daytona_service.py). Per AGENTS.md's own rule --
 "Do not add agents unless each one has a clear responsibility" -- wrapping
 it in another agent would add a stage with no responsibility beyond what
 the tool already does. The orchestrator calls it directly instead.
+
+Run from the backend/ directory (as a module -- `python agents/orchestrator.py`
+fails with ModuleNotFoundError, since this script imports sibling packages
+like `fred` that are only resolvable when backend/ itself is on the path):
+    python -m agents.orchestrator
 """
 
 from __future__ import annotations
 
 import asyncio
 
-from fred import evaluation_service, run_economic_analysis
-
 from agents.indicator_agent import select_indicators
 from agents.research_agent import research
 from agents.writer_agent import write_report
+from fred import evaluation_service, run_economic_analysis
 
 
 async def run_report_pipeline(category: str) -> str:

@@ -45,8 +45,9 @@ def _default_download_request_factory(source: str, destination: str) -> Any:
 
 
 def _default_daytona_client() -> Any:
-    from api_key import daytona_api
     from daytona import Daytona, DaytonaConfig
+
+    from api_key import daytona_api
 
     return Daytona(DaytonaConfig(api_key=daytona_api))
 

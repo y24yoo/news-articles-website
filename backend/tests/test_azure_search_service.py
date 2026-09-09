@@ -1,4 +1,5 @@
 import pytest
+
 from services.azure_search_service import (
     AzureSearchService,
     build_economic_documents_index,

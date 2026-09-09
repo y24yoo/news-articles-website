@@ -1,5 +1,6 @@
 import httpx
 import pytest
+
 from services.fred_service import FredApiError, FredService
 
 

@@ -1,4 +1,5 @@
 import pytest
+
 from services.evaluation_service import EvaluationService, validate_report_html
 
 # --- validate_report_html -----------------------------------------------------

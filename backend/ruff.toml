@@ -1,0 +1,2 @@
+[lint.isort]
+known-first-party = ["fred", "articles", "api_key", "services", "agents", "scripts"]
