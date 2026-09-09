@@ -13,3 +13,6 @@ firecrawl-py==4.42.0
 agent-framework==1.17.0
 agent-framework-foundry==1.12.0
 azure-identity==1.25.3
+
+# Phase 4: Azure AI Search
+azure-search-documents==12.0.0
