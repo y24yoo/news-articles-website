@@ -1,4 +1,5 @@
 import pytest
+
 from agents import indicator_agent as indicator_agent_module
 from agents import orchestrator
 from agents import research_agent as research_agent_module

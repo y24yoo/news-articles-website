@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 from services.firecrawl_service import FirecrawlService, document_id_for_url
 
 

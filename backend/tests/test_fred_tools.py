@@ -1,5 +1,6 @@
-import fred
 import pytest
+
+import fred
 from services.evaluation_service import EvaluationService
 from services.fred_service import FredApiError
 

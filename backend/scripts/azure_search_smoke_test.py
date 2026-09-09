@@ -11,8 +11,10 @@ Setup:
     2. Fill in AZURE_SEARCH_ENDPOINT and FRED_API_KEY in backend/.env
        (copy from .env.example) and create backend/api_key.py per the README
 
-Run from the backend/ directory:
-    python scripts/azure_search_smoke_test.py
+Run from the backend/ directory (as a module -- `python scripts/azure_search_smoke_test.py`
+fails with ModuleNotFoundError, since this script imports sibling packages
+like `fred` that are only resolvable when backend/ itself is on the path):
+    python -m scripts.azure_search_smoke_test
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 import asyncio
 
 from dotenv import load_dotenv
+
 from fred import azure_search_service, cpi
 
 

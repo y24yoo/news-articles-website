@@ -9,8 +9,10 @@ Setup:
     2. Copy backend/.env.example to backend/.env and fill in
        FOUNDRY_PROJECT_ENDPOINT and FOUNDRY_MODEL.
 
-Run from the backend/ directory:
-    python scripts/foundry_smoke_test.py
+Run from the backend/ directory (as a module -- `python scripts/foundry_smoke_test.py`
+fails with ModuleNotFoundError, since this script imports sibling packages
+like `services` that are only resolvable when backend/ itself is on the path):
+    python -m scripts.foundry_smoke_test
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 import asyncio
 
 from dotenv import load_dotenv
+
 from services.foundry_service import FoundryService
 
 
